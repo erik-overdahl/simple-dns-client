@@ -1,0 +1,668 @@
+#+TITLE: Simple DNS client
+
+Implementation of a DNS client using the low-level ~syscall~ api in Go.
+
+* Opening a socket
+[[https://beej.us/guide/bgnet/html/index-wide.html#system-calls-or-bust][Beej networking guide]]
+
+Need to open a UDP socket using IPv4. Set the REUSEADDR sockopt so that
+the program can be rerun immediately without waiting for the OS to open
+the port up.
+
+#+NAME: open-socket
+#+begin_src go
+sockFd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, syscall.IPPROTO_UDP)
+if err != nil {
+	panic(err)
+}
+
+defer syscall.Close(sockFd)
+
+err = syscall.SetsockoptInt(sockFd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+if err != nil {
+	panic(err)
+}
+#+end_src
+
+* Binding to a port
+We'll let the OS choose the port by calling ~bind()~ with port 0. We can
+then find out what port was bound using ~Getsockname()~.
+
+#+NAME: bind-port
+#+begin_src go
+err = syscall.Bind(sockFd, &syscall.SockaddrInet4{Port:0})
+if err != nil {
+	panic(err)
+}
+sa, err := syscall.Getsockname(sockFd)
+if err != nil {
+	panic(err)
+}
+boundPort := sa.(*syscall.SockaddrInet4).Port
+fmt.Printf("Opened UDP socket on port %d\n", boundPort)
+#+end_src
+
+* Encoding the query message
+The format for the DNS message is defined in section 4.1 of [[https://datatracker.ietf.org/doc/html/rfc1035#section-4][RFC 1035]].
+Because ~sendTo()~ takes a plain byte slice rather than a struct, we
+will just write a function that packs a byte slice approriately.
+
+The DNS header contains a 16-bit transaction id (chosen by the
+application), 16 bits of flags, and then 4 16-bit numbers for
+determining the length of different segements of the coming data.
+
+In the first byte of flags:
+ - the first bit is set if the message is a response
+ - the next 4 bits are the OPCODE: 0 (standard query), 1 (inverse query),
+   2 (server status), and 3-15 (reserved in 1987 for future use -
+   probably at least some have been defined by now...)
+ - the sixth bit (Authoritative Answer) is set if the responding server
+   is an authority for the request domain
+ - the seventh bit (TrunCation) is set if the message was truncated
+   because its size was too great for the transmission channel
+ - the eighth bit (Recursion Desired) is set if the server should pursue
+   the query recursively
+
+We only maybe have to set the Recursion Desired bit.
+
+In the second byte of flags:
+ - the first bit (Recursion Available) is set if the server supports
+   recursive queries
+ - the next 3 bits are reserved for future use (as of 1987) and must be 0
+ - the last 4 bits are the response code
+
+Then come four 16 bit numbers, indicating how many of each type of
+record the message contains for each section:
+ - QDCOUNT: entries in the question section
+ - ANCOUNT: resource records in the answer section
+ - NSCOUNT: name server resource records in the authority records section
+ - ARCOUNT: resource records in the additional records section
+
+We are just sending 1 query, so QDCOUNT is 1. The rest are 0.
+
+#+NAME: make-dns-query-header
+#+begin_src go
+func makeDNSQueryHeader(txId uint16, recurse bool) []byte {
+	header := make([]byte, 12)
+	header[0] = byte((txId & 0xFF00) >> 8)
+	header[1] = byte(txId & 0xFF)
+	if recurse {
+		header[2] = 1
+	} else {
+		header[2] = 0
+	}
+	header[5] = 1
+	return header
+}
+#+end_src
+
+After the header, we have to encode the "question". This has three
+parts.
+
+The first part is the QNAME. The full hostname to be resolved is split
+into its component parts, and each part is prepended with its length.
+The zero byte indicates the end of the QNAME field.
+
+The second and third parts are both 2-octet fields, representing the
+query type (QTYPE) and query class (QCLASS) repectively. The TYPE values
+and CLASS values are defined in section 12 of RFC 1035 (more have been
+added in subsequent RFCs).
+
+For this function, we will assume we have just the hostname - any paths
+or protocol identifiers have already been stripped.
+
+#+NAME: make-dns-question
+#+begin_src go
+func makeDNSQuestion(hostname string, qType uint16, qClass uint16) []byte {
+	question := []byte{}
+	parts := strings.Split(hostname, ".")
+	for _, p := range parts {
+		question = append(question, byte(len(p)))
+		question = append(question, []byte(p)...)
+	}
+	question = append(question, 0)
+	t1 := byte((qType & 0xFF00) >> 8)
+	t2 := byte(qType & 0xFF)
+	c1 := byte((qClass & 0xFF00) >> 8)
+	c2 := byte(qClass & 0xFF)
+	question = append(question, []byte{t1, t2, c1,c2}...)
+	return question
+}
+#+end_src
+
+Now we can put the pieces together to generate a full query. We will
+need to generate a transaction id and pass the correct QTYPE and QCLASS,
+which for a simple query are =A= (host address) and =IN= (Internet);
+these are defined as constants.
+
+#+NAME: make-dns-query
+#+begin_src go
+func makeDNSQuery(hostname string) []byte {
+	txId := uint16(r.Uint32() >> 16)
+	query := makeDNSQueryHeader(txId, true)
+	question := makeDNSQuestion(hostname, 1, 1)
+	query = append(query, question...)
+	return query
+}
+#+end_src
+
+* Sending the message
+We need to send our message to port 53 on the DNS server - using
+Google's at ~8.8.8.8~
+
+#+NAME: send-query
+#+begin_src go
+query := makeDNSQuery(hostname)
+dnsServer := syscall.SockaddrInet4{
+	Addr: [4]byte{8,8,8,8},
+	Port: 53,
+}
+// fmt.Printf("%v\n", query)
+err = syscall.Sendto(sockFd, query, 0, &dnsServer)
+if err != nil {
+	panic(err)
+}
+#+end_src
+
+* Receiving the response
+Now that we have sent a request, we need to get the response from the
+server. We will read the bytes from the socket into a buffer and then
+decode them later.
+
+#+NAME: get-response
+#+begin_src go
+response := make([]byte, 65536)
+bytesRead := 0
+for bytesRead <= 0 {
+	bytesRead, _, err = syscall.Recvfrom(sockFd, response, 0)
+	if err != nil {
+		panic(err)
+	}
+}
+response = response[:bytesRead]
+#+end_src
+
+* Decoding the response
+A DNS response has the same format as the DNS query. The question is
+echoed back, followed by the response records.
+
+Let's unpack the response into a collection of structs. The format for
+the response records is the same for each type of response, and is
+defined in [[https://datatracker.ietf.org/doc/html/rfc1035#section-4.1.3][RFC 1035 section 4.1.3]].
+
+#+NAME: dns-resource-record-struct
+#+begin_src go
+type DNSResourceRecord struct {
+	Type 		uint16
+	Class		uint16
+	TTL		uint32
+	RDLength 	uint16
+	Name		[]byte
+	RData		[]byte
+}
+#+end_src
+
+#+NAME: dns-question-struct
+#+begin_src go
+type DNSQuestion struct {
+	Type	uint16
+	Class	uint16
+	Name	[]byte
+}
+#+end_src
+
+#+NAME: dns-payload-struct
+#+begin_src go
+type DNSPayload struct {
+	TransactionId	uint16
+	lFlagBits		byte
+	rFlagBits		byte
+	QDCount	 	uint16
+	ANCount		uint16
+	NSCount		uint16
+	ARCount		uint16
+  Size			int
+	Questions		[]DNSQuestion
+	Records		[]DNSResourceRecord
+}
+
+func (h DNSPayload) IsResponse() bool {
+	return h.lFlagBits & 0x80 == 1
+}
+
+func (h DNSPayload) Opcode() int {
+	return int((h.lFlagBits >> 3) & 0xF)
+}
+
+func (h DNSPayload) AuthoritativeAnswer() bool {
+	return h.lFlagBits & 4 == 1
+}
+
+func (h DNSPayload) Truncated() bool {
+	return h.lFlagBits & 2 == 1
+}
+
+func (h DNSPayload) RecursionDesired() bool {
+	return h.lFlagBits & 1 == 1
+}
+
+func (h DNSPayload) RecursionAvailable() bool {
+	return h.rFlagBits & 0x80 == 1
+}
+
+func (h DNSPayload) Z() int {
+	return int((h.rFlagBits >> 4) & 0x7)
+}
+
+func (h DNSPayload) ResponseCode() int {
+	return int(h.rFlagBits & 0xF)
+}
+#+end_src
+
+Let's define utility methods for packing two bytes into a =uint16= and 4
+bytes into a =uint32=.
+
+#+NAME: bytes-to-uints
+#+begin_src go
+func bytesToUint16(b []byte) uint16 {
+	return (uint16(b[0]) << 8) | uint16(b[1])
+}
+
+func bytesToUint32(b []byte) uint32 {
+	result := uint32(b[0])
+	for _, n := range b[1:] {
+		result = (result << 8) | uint32(n)
+	}
+	return result
+}
+#+end_src
+
+Error checking? Who needs it?
+
+#+NAME: decode-header
+#+begin_src go
+func decodeHeader(response []byte) *DNSPayload {
+	return &DNSPayload{
+		TransactionId: bytesToUint16(response[0:2]),
+		lFlagBits: response[2],
+		rFlagBits: response[3],
+		QDCount: bytesToUint16(response[4:6]),
+		ANCount: bytesToUint16(response[6:8]),
+		NSCount: bytesToUint16(response[8:10]),
+		ARCount: bytesToUint16(response[10:12]),
+		Size: len(response),
+	}
+}
+#+end_src
+
+Before we can decode the records in the payload, we need to understand
+how to unpack the names, which are compressed. A domain name in a record
+could be represented as a sequence of labels ending in a 0 byte, a
+pointer, or a sequence of labels ending in a pointer. A pointer is a
+2-octet value containing 2 set leading set bits and then 14 bits giving
+the offset of the start of the name from the beginning of the message.
+Names don't end until we hit a 0-byte, so you could have a name that
+adds onto another name in the message by listing a label and then
+another pointer.
+
+#+NAME: decode-name
+#+begin_src go
+
+func decodeName(response, name []byte, pos int) int {
+	offset := pos
+	var pointer uint16
+	for b := response[offset]; b != 0; {
+		if b&0xC0 == 0xC0 { // we have a pointer
+			pointer = bytesToUint16(response[offset : offset+2])
+			offset = int(pointer & 0x3FFF)
+		} else { // we have a number
+			size := int(b)
+			for i := 1; i <= size; i++ {
+				name = append(name, response[offset+i])
+			}
+			name = append(name, '.')
+			offset += size + 1
+		}
+		b = response[offset]
+	}
+	if pointer == 0 {
+		return offset + 1
+	}
+	return pos + 2
+}
+#+end_src
+
+#+NAME: decode-question
+#+begin_src go
+func decodeQuestion(response []byte, question *DNSQuestion, pos int) int {
+	question.Name = []byte{}
+	pos = decodeName(response, question.Name, pos)
+	question.Type = bytesToUint16(response[pos:pos+2])
+	question.Class = bytesToUint16(response[pos+2:pos+4])
+	return pos + 4
+}
+#+end_src
+
+#+NAME: decode-record
+#+begin_src go
+func decodeRecord(response []byte, record *DNSResourceRecord, pos int) int {
+	record.Name = []byte{}
+	pos = decodeName(response, record.Name, pos)
+	record.Type = bytesToUint16(response[pos:pos+2])
+	record.Class = bytesToUint16(response[pos+2:pos+4])
+	record.TTL = bytesToUint32(response[pos+4:pos+8])
+	record.RDLength = bytesToUint16(response[pos+8:pos+10])
+	dataLen := int(record.RDLength)
+	pos += 10
+	record.RData = response[pos : pos+dataLen]
+	return pos + dataLen
+}
+#+end_src
+
+#+NAME: decode-response
+#+begin_src go
+func decodeResponse(response []byte) *DNSPayload {
+	payload := decodeHeader(response)
+	pos := 12
+	numQuestions := int(payload.QDCount)
+	questions := make([]DNSQuestion, numQuestions)
+	for i := 0; i < numQuestions; i++ {
+		question := &DNSQuestion{}
+		pos = decodeQuestion(response, question, pos)
+		questions[i] = *question
+	}
+	numRecords := int(payload.ANCount) + int(payload.NSCount) + int(payload.ARCount)
+	records := make([]DNSResourceRecord, numRecords)
+	for i := 0; i < numRecords; i++ {
+		record := &DNSResourceRecord{}
+		pos = decodeRecord(response, record, pos)
+		records[i] = *record
+	}
+	payload.Questions = questions
+	payload.Records = records
+	return payload
+}
+#+end_src
+
+* Output
+Now we want to report the results of our query. We'll try to make the
+output look like that of ~dig~.
+
+Going to skip the EDNS stuff for now.
+
+#+NAME: output
+#+begin_src go
+func buildOutput(payload *DNSPayload) string {
+	queryType := "Recursive query for"
+	if !payload.RecursionDesired() {
+		queryType = "Iterative query for"
+	}
+	sep := " "
+	hostname := string(payload.Questions[0].Name) + "\n"
+	if len(payload.Questions) > 1 {
+		sep = ":\n\t"
+		for _, q := range payload.Questions[1:] {
+			hostname = fmt.Sprintf("%s\t%s\n", hostname, string(q.Name))
+		}
+	}
+	output := fmt.Sprintf("%s%s%s\n", queryType, sep, hostname)
+	output = fmt.Sprintf("%sGot answer:\nopcode: %s, status: %s, id: %d\n", output, OPCODES[payload.Opcode()], RCODES[payload.ResponseCode()], payload.TransactionId)
+	flags := "flags:"
+	if payload.IsResponse() {
+		flags += " qr"
+	}
+	if payload.AuthoritativeAnswer() {
+		flags += " aa"
+	}
+	if payload.Truncated() {
+		flags += " tc"
+	}
+	if payload.RecursionDesired() {
+		flags += " rd"
+	}
+	if payload.RecursionAvailable() {
+		flags += " ra"
+	}
+	output = fmt.Sprintf("%s%s; QUERY: %d, ANSWER: %d, AUTHORITY: %d, ADDITIONAL: %d\n\n", output, flags, payload.QDCount, payload.ANCount, payload.NSCount, payload.ARCount)
+	// EDNS
+	// if payload.ARCount > 0 {
+	// 	edns := ""
+	// 	arStart := int(payload.QDCount) + int(payload.ANCount) + int(payload.NSCount)
+	// 	for _, a := range payload.Records[arStart:] {
+	// 		if
+	// 	}
+	// }
+	questionSection := "QUESTION:\n"
+	for _, q := range payload.Questions {
+		questionSection = fmt.Sprintf("%s%s\t\t%s\t%s\n", questionSection, string(q.Name), QTYPES[int(q.Type)], QCLASSES[int(q.Class)])
+	}
+	answerSection := ""
+	if int(payload.ANCount) > 0 {
+		answerSection = "ANSWER:\n"
+		for i := 0; i < int(payload.ANCount); i++ {
+			a := payload.Records[i]
+			ip := fmt.Sprintf("%d", a.RData[0])
+			for _, piece := range a.RData[1:] {
+				ip = fmt.Sprintf("%s.%d", ip, piece)
+			}
+			answerSection = fmt.Sprintf("%s%s\t%d\t%s\t%s\t%s\n", answerSection, string(a.Name), a.TTL, QTYPES[int(a.Type)], QCLASSES[int(a.Class)], ip)
+		}
+	}
+	output = fmt.Sprintf("%s%s\n%s\n",output, questionSection, answerSection)
+	return output
+}
+#+end_src
+
+* Enums
+[[https://www.iana.org/assignments/dns-parameters/dns-parameters.xhtml]]
+
+#+NAME: qclasses
+#+begin_src go
+var QCLASSES = map[int]string{
+	0: "RESERVED",
+	1: "IN",
+	3: "CH",
+	4: "HS",
+	254: "NONE",
+	255: "ANY",
+	65535: "RESERVED",
+}
+#+end_src
+
+#+NAME: qtypes
+#+begin_src go
+var QTYPES = map[int]string{
+	 0: "RESERVED",
+	1: "A",
+	2: "NS",
+	3: "MD",
+	4: "MF",
+	5: "CNAME",
+	6: "SOA",
+	7: "MB",
+	8: "MG",
+	9: "MR",
+	10: "NULL",
+	11: "WKS",
+	12: "PTR",
+	13: "HINFO",
+	14: "MINFO",
+	15: "MX",
+	16: "TXT",
+	17: "RP",
+	18: "AFSDB",
+	19: "X25",
+	20: "ISDN",
+	21: "RT",
+	22: "NSAP",
+	23: "NSAP_PTR",
+	24: "SIG",
+	25: "KEY",
+	26: "PX",
+	27: "GPOS",
+	28: "AAAA",
+	29: "LOC",
+	30: "NXT",
+	31: "EID",
+	32: "NIMLOC",
+	33: "SRV",
+	34: "ATMA",
+	35: "NAPTR",
+	36: "KX",
+	37: "CERT",
+	38: "A6",
+	39: "DNAME",
+	40: "SINK",
+	41: "OPT",
+	42: "APL",
+	43: "DS",
+	44: "SSHFP",
+	45: "IPSECKEY",
+	46: "RRSIG",
+	47: "NSEC",
+	48: "DNSKEY",
+	49: "DHCID",
+	50: "NSEC3",
+	51: "NSEC3_PARAM",
+	52: "TLSA",
+	53: "SMIMEA",
+	55: "HIP",
+	56: "NINFO",
+	57: "RKEY",
+	58: "TALINK",
+	59: "CDS",
+	60: "CDNSKEY",
+	61: "OPENPGPKEY",
+	62: "CSYNC",
+	63: "ZONEMD",
+	64: "SVCB",
+	65: "HTTPS",
+	99: "SPF",
+	100: "UINFO",
+	101: "UID",
+	102: "GID",
+	103: "UNSPEC",
+	104: "NID",
+	105: "L32",
+	106: "L64",
+	107: "LP",
+	108: "EUI48",
+	109: "EUI64",
+	249: "TKEY",
+	250: "TSIG",
+	251: "IXFR",
+	252: "AXFR",
+	253: "MAILB",
+	254: "MAILA",
+	255: "ANY",
+	256: "URI",
+	257: "CAA",
+	258: "AVC",
+	259: "DOA",
+	260: "AMTRELAY",
+	32768: "TA",
+	32769: "DLV",
+}
+#+end_src
+
+#+NAME: opcodes
+#+begin_src go
+var OPCODES = map[int]string{
+	0: "QUERY",
+	1: "INVERSE", //obsolete
+	2: "STATUS",
+	4: "NOTIFY",
+	5: "UPDATE",
+	6: "DSO",
+}
+#+end_src
+
+#+NAME: rcodes
+#+begin_src go
+var RCODES = map[int]string{
+	0: "NOERROR", //  	No Error 	[RFC1035]
+1: "FORMERR", //  	Format Error 	[RFC1035]
+2: "SERVFAIL", //  	Server Failure 	[RFC1035]
+3: "NXDOMAIN", //  	Non-Existent Domain 	[RFC1035]
+4: "NOTIMP", //  	Not Implemented 	[RFC1035]
+5: "REFUSED", //  	Query Refused 	[RFC1035]
+6: "YXDOMAIN", //  	Name Exists when it should not 	[RFC2136][RFC6672]
+7: "YXRRSET", //  	RR Set Exists when it should not 	[RFC2136]
+8: "NXRRSET", //  	RR Set that should exist does not 	[RFC2136]
+9: "NOTAUTH", //  	Not Authorized 	[RFC8945]
+10: "NOTZONE", //  	Name not contained in zone 	[RFC2136]
+11: "DSOTYPENI", //  	DSO-TYPE Not Implemented 	[RFC8490]
+16: "BADSIG", //  	TSIG Signature Failure 	[RFC8945]
+17: "BADKEY", //  	Key not recognized 	[RFC8945]
+18: "BADTIME", //  	Signature out of time window 	[RFC8945]
+19: "BADMODE", //  	Bad TKEY Mode 	[RFC2930]
+20: "BADNAME", //  	Duplicate key name 	[RFC2930]
+21: "BADALG", //  	Algorithm not supported 	[RFC2930]
+22: "BADTRUNC", //  	Bad Truncation 	[RFC8945]
+23: "BADCOOKIE", //  	Bad/missing Server Cookie 	[RFC7873]
+}
+#+end_src
+
+* Files :noexport:
+#+begin_src go :tangle ./dns-client.go :noweb yes
+package main
+
+import (
+	"syscall"
+	"fmt"
+	"math/rand"
+	"strings"
+	"time"
+)
+
+var r = rand.New(rand.NewSource(time.Now().UnixNano()))
+
+func main() {
+	hostname := "www.google.com"
+	<<open-socket>>
+	<<bind-port>>
+	<<send-query>>
+	<<get-response>>
+	decoded := decodeResponse(response)
+	fmt.Printf("%s\n", buildOutput(decoded))
+}
+
+<<output>>
+
+<<make-dns-query>>
+
+<<make-dns-question>>
+
+<<make-dns-query-header>>
+#+end_src
+
+#+begin_src go :tangle ./response.go :noweb yes
+package main
+
+<<dns-resource-record-struct>>
+
+<<dns-question-struct>>
+
+<<dns-payload-struct>>
+
+<<decode-response>>
+
+<<decode-header>>
+
+<<decode-question>>
+
+<<decode-record>>
+
+<<decode-name>>
+
+<<bytes-to-uints>>
+#+end_src
+
+#+begin_src go :tangle ./constants.go :noweb yes
+package main
+
+<<qtypes>>
+<<qclasses>>
+<<opcodes>>
+<<rcodes>>
+#+end_src
